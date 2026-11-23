@@ -73,3 +73,51 @@ Save secrets and reboot/redeploy the app. The application checks the Supabase ta
 - [ ] Verify blank tables show no validation errors until Validate is clicked.
 - [ ] Save, reload, and delete a custom theorem and an algebra.
 - [ ] Confirm data remains after app reboot.
+
+
+## Unified Algebra & Theorem Workbench
+
+The main workbench now combines algebra editing, saved algebra loading, theorem/algorithm selection, theorem creation, and step-by-step proof output on one screen. The six original built-in algorithms remain permanent. Custom theorems saved by a user appear in the same algorithm selector and can be run against the currently loaded algebra. Saved algebras and saved theorems remain account-specific. Proof traces are generated when an algorithm is run; the theorem definition is what is persisted in the reusable library.
+
+
+## Root-admin approval, email login, and password reset
+
+### 1. Upgrade the Supabase schema
+
+In Supabase Dashboard → SQL Editor, run the latest `supabase_schema.sql`. It adds the email, account status, admin flag, and password-reset table to an existing installation without deleting saved algebra or theorem records. Existing accounts are kept approved by default during migration.
+
+### 2. Configure Streamlit Secrets
+
+Add these values in Streamlit Cloud → App → Settings → Secrets (use real values; never commit them to Git):
+
+```toml
+SUPABASE_URL = "https://YOUR-PROJECT-REF.supabase.co"
+SUPABASE_SERVICE_ROLE_KEY = "YOUR-SERVER-SIDE-SERVICE-ROLE-KEY"
+ROOT_ADMIN_USERNAME = "root"
+ROOT_ADMIN_EMAIL = "admin@example.com"
+ROOT_ADMIN_PASSWORD = "USE-A-LONG-RANDOM-PASSWORD-AT-LEAST-14-CHARACTERS"
+
+SMTP_HOST = "smtp.example.com"
+SMTP_PORT = "587"
+SMTP_USERNAME = "your-smtp-login"
+SMTP_PASSWORD = "your-smtp-app-password"
+SMTP_FROM = "Algebra Engine <no-reply@example.com>"
+```
+
+The root account is provisioned from these secrets at app startup and is always approved. Do not create it through the public registration form. Use a unique, high-entropy root password.
+
+### 3. Account lifecycle
+
+- Public registration requires email, username, and password. New accounts start as `pending`.
+- Pending and suspended accounts cannot enter the workbench.
+- Root admin can view all account usernames, emails, statuses, and registration dates, and approve, suspend, or reactivate users.
+- Users can sign in with either username or email.
+- Password reset sends a six-digit code to the registered email. Codes expire after 15 minutes and are stored as hashes. SMTP settings are required for this feature.
+
+### 4. Deploy
+
+Commit the updated project files, update Streamlit Secrets, and reboot/redeploy the Streamlit app. Test with a non-admin registration: it should remain pending until the root admin approves it. Test password reset with an email inbox you control.
+
+### Security notes
+
+The app's current custom password hashing uses PBKDF2-HMAC-SHA256. The Supabase service-role key and root credentials must remain server-side in Streamlit Secrets. For a high-assurance public production deployment, add email verification, rate limiting, audit logging, and consider migrating authentication to Supabase Auth rather than extending custom password storage.

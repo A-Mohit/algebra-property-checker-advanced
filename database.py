@@ -12,6 +12,9 @@ import os
 import re
 import secrets
 import sqlite3
+import smtplib
+from email.message import EmailMessage
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -62,93 +65,213 @@ def _hash_password(password: str, salt: bytes | None = None) -> tuple[str, str]:
     return salt.hex(), digest.hex()
 
 
+def _ensure_sqlite_columns(conn):
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
+    additions = {
+        "email": "TEXT",
+        "status": "TEXT NOT NULL DEFAULT 'approved'",
+        "is_admin": "INTEGER NOT NULL DEFAULT 0",
+    }
+    for name, definition in additions.items():
+        if name not in cols:
+            conn.execute(f"ALTER TABLE users ADD COLUMN {name} {definition}")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_email_unique ON users(email) WHERE email IS NOT NULL")
+    conn.execute("""CREATE TABLE IF NOT EXISTS password_resets (
+        email TEXT PRIMARY KEY, token_hash TEXT NOT NULL, expires_at TEXT NOT NULL
+    )""")
+    for table in ("theorems", "algebras"):
+        cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if "user_id" not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN user_id TEXT")
+
+
+def _ensure_root_admin():
+    username = (_setting("ROOT_ADMIN_USERNAME") or "").strip().lower()
+    email = (_setting("ROOT_ADMIN_EMAIL") or "").strip().lower()
+    password = _setting("ROOT_ADMIN_PASSWORD") or ""
+    if not (username and email and password):
+        return
+    if len(password) < 14:
+        raise RuntimeError("ROOT_ADMIN_PASSWORD must contain at least 14 characters.")
+    salt, digest = _hash_password(password)
+    if _supabase_configured():
+        client = _supabase()
+        found = client.table("users").select("username,is_admin").eq("username", username).limit(1).execute().data
+        payload = {"username": username, "email": email, "password_salt": salt,
+                   "password_hash": digest, "status": "approved", "is_admin": True}
+        if found:
+            # Keep admin password in sync with deployment secret; do not downgrade admin.
+            client.table("users").update(payload).eq("username", username).execute()
+        else:
+            client.table("users").insert(payload).execute()
+    else:
+        with get_connection() as conn:
+            conn.execute("""INSERT INTO users(username,email,password_salt,password_hash,status,is_admin)
+                VALUES(?,?,?,?, 'approved',1) ON CONFLICT(username) DO UPDATE SET
+                email=excluded.email,password_salt=excluded.password_salt,
+                password_hash=excluded.password_hash,status='approved',is_admin=1""",
+                (username, email, salt, digest))
+
+
 def initialize_database():
     if _supabase_configured():
-        # Verify the hosted schema and credentials are ready. Schema is created
-        # explicitly using the SQL script supplied in supabase_schema.sql.
         client = _supabase()
-        for table in ("users", "theorems", "algebras"):
+        for table in ("users", "theorems", "algebras", "password_resets"):
             client.table(table).select("*").limit(1).execute()
-        return
-
-    with get_connection() as conn:
-        conn.execute("""CREATE TABLE IF NOT EXISTS users (
-            username TEXT PRIMARY KEY COLLATE NOCASE,
-            password_salt TEXT NOT NULL,
-            password_hash TEXT NOT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )""")
-        conn.execute("""CREATE TABLE IF NOT EXISTS theorems (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, name TEXT NOT NULL,
-            variable_count INTEGER NOT NULL, lhs TEXT NOT NULL, rhs TEXT NOT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(user_id, name, lhs, rhs),
-            FOREIGN KEY(user_id) REFERENCES users(username) ON DELETE CASCADE
-        )""")
-        conn.execute("""CREATE TABLE IF NOT EXISTS algebras (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, name TEXT NOT NULL,
-            elements_json TEXT NOT NULL, theta_json TEXT NOT NULL, phi_json TEXT NOT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(user_id, name),
-            FOREIGN KEY(user_id) REFERENCES users(username) ON DELETE CASCADE
-        )""")
-        # Upgrade older single-user SQLite databases without deleting saved data.
-        for table in ("theorems", "algebras"):
-            cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
-            if "user_id" not in cols:
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN user_id TEXT")
+    else:
+        with get_connection() as conn:
+            conn.execute("""CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY COLLATE NOCASE,
+                password_salt TEXT NOT NULL, password_hash TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS theorems (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, name TEXT NOT NULL,
+                variable_count INTEGER NOT NULL, lhs TEXT NOT NULL, rhs TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP, UNIQUE(user_id,name,lhs,rhs),
+                FOREIGN KEY(user_id) REFERENCES users(username) ON DELETE CASCADE)""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS algebras (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, name TEXT NOT NULL,
+                elements_json TEXT NOT NULL, theta_json TEXT NOT NULL, phi_json TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP, UNIQUE(user_id,name),
+                FOREIGN KEY(user_id) REFERENCES users(username) ON DELETE CASCADE)""")
+            _ensure_sqlite_columns(conn)
+    _ensure_root_admin()
 
 
-def register_user(username: str, password: str) -> tuple[bool, str]:
+def register_user(username: str, email: str, password: str) -> tuple[bool, str]:
     username = username.strip().lower()
-    if not 3 <= len(username) <= 32:
-        return False, "Username must contain 3–32 characters."
-    if not re.fullmatch(r"[a-z0-9_-]+", username):
-        return False, "Use only letters, numbers, underscores, and hyphens."
+    email = email.strip().lower()
+    if not 3 <= len(username) <= 32 or not re.fullmatch(r"[a-z0-9_-]+", username):
+        return False, "Username must be 3–32 characters using letters, numbers, underscores, or hyphens."
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        return False, "Enter a valid email address."
     if len(password) < 10:
         return False, "Use a password with at least 10 characters."
     salt, digest = _hash_password(password)
     try:
+        payload = {"username": username, "email": email, "password_salt": salt,
+                   "password_hash": digest, "status": "pending", "is_admin": False}
         if _supabase_configured():
-            _supabase().table("users").insert({
-                "username": username, "password_salt": salt, "password_hash": digest
-            }).execute()
+            _supabase().table("users").insert(payload).execute()
         else:
             with get_connection() as conn:
-                conn.execute(
-                    "INSERT INTO users(username, password_salt, password_hash) VALUES (?, ?, ?)",
-                    (username, salt, digest),
-                )
-                # Preserve data from the earlier single-user local version for
-                # the first account created after upgrade.
+                conn.execute("""INSERT INTO users(username,email,password_salt,password_hash,status,is_admin)
+                    VALUES(?,?,?,?, 'pending',0)""", (username,email,salt,digest))
                 conn.execute("UPDATE theorems SET user_id=? WHERE user_id IS NULL", (username,))
                 conn.execute("UPDATE algebras SET user_id=? WHERE user_id IS NULL", (username,))
-        return True, "Account created. You can now log in."
+        return True, "Registration submitted. Your account is pending root-admin approval."
     except Exception as exc:
-        message = str(exc).lower()
-        if "duplicate" in message or "unique" in message or "already exists" in message:
-            return False, "That username is already registered. Choose another one."
+        msg = str(exc).lower()
+        if any(x in msg for x in ("duplicate", "unique", "already exists", "23505")):
+            return False, "That username or email is already registered."
         raise
 
 
-def authenticate_user(username: str, password: str) -> bool:
-    username = username.strip().lower()
+def _find_user(identifier: str):
+    identifier = identifier.strip().lower()
     if _supabase_configured():
-        rows = (_supabase().table("users").select("password_salt,password_hash")
-                .eq("username", username).limit(1).execute().data)
-        row = rows[0] if rows else None
+        client = _supabase()
+        rows = client.table("users").select("*").eq("username", identifier).limit(1).execute().data
+        if not rows:
+            rows = client.table("users").select("*").eq("email", identifier).limit(1).execute().data
+        return rows[0] if rows else None
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM users WHERE username=? COLLATE NOCASE OR email=? COLLATE NOCASE LIMIT 1",
+                           (identifier, identifier)).fetchone()
+        return dict(row) if row else None
+
+
+def authenticate_user(identifier: str, password: str):
+    row = _find_user(identifier)
+    if not row:
+        return False, None, "Incorrect username/email or password."
+    _, candidate = _hash_password(password, bytes.fromhex(row["password_salt"]))
+    if not hmac.compare_digest(candidate, row["password_hash"]):
+        return False, None, "Incorrect username/email or password."
+    if row.get("status") != "approved":
+        if row.get("status") == "suspended":
+            return False, None, "This account is suspended. Contact the administrator."
+        return False, None, "Your account is pending root-admin approval."
+    return True, {"username": row["username"], "email": row.get("email"), "is_admin": bool(row.get("is_admin"))}, "Login successful."
+
+
+def list_all_users():
+    if _supabase_configured():
+        return _supabase().table("users").select("username,email,status,is_admin,created_at").order("created_at", desc=True).execute().data
+    with get_connection() as conn:
+        return [dict(r) for r in conn.execute("SELECT username,email,status,is_admin,created_at FROM users ORDER BY created_at DESC").fetchall()]
+
+
+def set_user_status(username: str, status: str):
+    if status not in {"approved", "pending", "suspended"}:
+        raise ValueError("Invalid account status.")
+    if _supabase_configured():
+        _supabase().table("users").update({"status": status}).eq("username", username).eq("is_admin", False).execute()
     else:
         with get_connection() as conn:
-            found = conn.execute(
-                "SELECT password_salt, password_hash FROM users WHERE username=? COLLATE NOCASE",
-                (username,),
-            ).fetchone()
-        row = dict(found) if found else None
-    if not row:
-        return False
-    _, candidate = _hash_password(password, bytes.fromhex(row["password_salt"]))
-    return hmac.compare_digest(candidate, row["password_hash"])
+            conn.execute("UPDATE users SET status=? WHERE username=? AND is_admin=0", (status, username))
 
+
+def _send_reset_email(email: str, token: str):
+    host = _setting("SMTP_HOST")
+    user = _setting("SMTP_USERNAME")
+    password = _setting("SMTP_PASSWORD")
+    sender = _setting("SMTP_FROM") or user
+    if not all((host, user, password, sender)):
+        raise RuntimeError("Password reset email is not configured. Set SMTP_HOST, SMTP_USERNAME, SMTP_PASSWORD, and SMTP_FROM in Streamlit Secrets.")
+    msg = EmailMessage()
+    msg["Subject"] = "Algebra Engine password reset code"
+    msg["From"] = sender
+    msg["To"] = email
+    msg.set_content(f"Your password reset code is: {token}\n\nIt expires in 15 minutes. If you did not request this, ignore this email.")
+    with smtplib.SMTP(host, int(_setting("SMTP_PORT", "587"))) as server:
+        server.starttls()
+        server.login(user, password)
+        server.send_message(msg)
+
+
+def request_password_reset(email: str):
+    email = email.strip().lower()
+    row = _find_user(email)
+    # Avoid revealing whether an email is registered.
+    if not row:
+        return True, "If that email belongs to an account, a reset code will be sent."
+    token = f"{secrets.randbelow(1000000):06d}"
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    expires = (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat()
+    if _supabase_configured():
+        _supabase().table("password_resets").upsert({"email": email, "token_hash": token_hash, "expires_at": expires}, on_conflict="email").execute()
+    else:
+        with get_connection() as conn:
+            conn.execute("INSERT INTO password_resets(email,token_hash,expires_at) VALUES(?,?,?) ON CONFLICT(email) DO UPDATE SET token_hash=excluded.token_hash,expires_at=excluded.expires_at", (email,token_hash,expires))
+    _send_reset_email(email, token)
+    return True, "If that email belongs to an account, a reset code will be sent."
+
+
+def complete_password_reset(email: str, token: str, new_password: str):
+    email = email.strip().lower()
+    if len(new_password) < 10:
+        return False, "New password must contain at least 10 characters."
+    if _supabase_configured():
+        rows = _supabase().table("password_resets").select("*").eq("email", email).limit(1).execute().data
+        reset = rows[0] if rows else None
+    else:
+        with get_connection() as conn:
+            row = conn.execute("SELECT * FROM password_resets WHERE email=?", (email,)).fetchone()
+            reset = dict(row) if row else None
+    if not reset or not hmac.compare_digest(hashlib.sha256(token.strip().encode()).hexdigest(), reset["token_hash"]):
+        return False, "Invalid or expired reset code."
+    if datetime.fromisoformat(reset["expires_at"]) < datetime.now(timezone.utc):
+        return False, "Invalid or expired reset code."
+    salt, digest = _hash_password(new_password)
+    if _supabase_configured():
+        _supabase().table("users").update({"password_salt": salt, "password_hash": digest}).eq("email", email).execute()
+        _supabase().table("password_resets").delete().eq("email", email).execute()
+    else:
+        with get_connection() as conn:
+            conn.execute("UPDATE users SET password_salt=?,password_hash=? WHERE email=?", (salt,digest,email))
+            conn.execute("DELETE FROM password_resets WHERE email=?", (email,))
+    return True, "Password reset successfully. You can now log in."
 
 def save_theorem(user_id, name, variable_count, lhs, rhs):
     payload = {"user_id": user_id, "name": name, "variable_count": variable_count, "lhs": lhs, "rhs": rhs}
